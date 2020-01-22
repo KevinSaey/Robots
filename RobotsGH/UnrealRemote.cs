@@ -18,7 +18,7 @@ namespace Robots.Grasshopper
     {
         TcpListener _server;
         TcpClient _client;
-        public bool Connected { get { return _client != null && _client.Connected; } }
+        public bool Connected => _client?.Connected == true;
         string _ip;
         int _port;
         bool _logDirty = false;
@@ -26,13 +26,14 @@ namespace Robots.Grasshopper
         byte[] _bytes = new byte[6 * 4];
         List<string> _log = new List<string>();
         bool _connect, _play, _pause;
+        Task _task;
 
         public UnrealRemote() : base("UnrealRemote", "UE Remote", "Connect and stream to Unreal engine", "Robots", "Components") { }
         public override Guid ComponentGuid => new Guid("0f69c3b9-a687-45e6-a250-d015d7df7f26");
         protected override System.Drawing.Bitmap Icon => Properties.Resources.iconURRemote;
         protected override void RegisterInputParams(GH_Component.GH_InputParamManager pManager)
         {
-            pManager.AddParameter(new ProgramParameter(), "Joints", "J", "Program", GH_ParamAccess.item);
+            pManager.AddParameter(new ProgramParameter(), "Program", "P", "Program", GH_ParamAccess.item);
             pManager.AddNumberParameter("PO", "Port", "Port of the server", GH_ParamAccess.item);
             pManager.AddTextParameter("IP", "IP", "IP address of the server", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Connect", "C", "Connect Unreal", GH_ParamAccess.item, false);
@@ -51,37 +52,75 @@ namespace Robots.Grasshopper
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            if (!_logDirty)
+            bool connect = false;
+            DA.GetData("Connect", ref connect);
+
+            if (!connect && Connected)
+            {
+                Dispose();
+            }
+
+            if (Connected)
+            {
+                GH_Program program = null;
+                if (!DA.GetData(0, ref program)) { return; }
+                SendJoints(program.Value);
+            }
+
+            if (connect && !Connected)
             {
                 GH_Number port = new GH_Number();
                 GH_String ip = new GH_String();
-                if (!DA.GetData("PO", ref port)) { _log.Add("No Port found"); }
-                if (!DA.GetData("IP", ref ip)) { _log.Add("No IP found"); }
-                else
-                {
-                    _port = (int)port.Value;
-                    _ip = ip.ToString();
-                    if (DA.GetData("Connect", ref _connect))
-                    {
-                        Task.Run(async () => await ConnectToUnreal())
-                            .ContinueWith(task => _logDirty = true);
-                    }
-                }
-            }
+                if (!DA.GetData("PO", ref port)) { _log.Add("No Port found"); return; }
+                if (!DA.GetData("IP", ref ip)) { _log.Add("No IP found"); return; }
+
+                _port = (int)port.Value;
+                _ip = ip.ToString();
+
+                _log.Clear();
+                ConnectToUnreal();
+
+                // if (_task == null || _task.Status != TaskStatus.Running)
+                //  {
 
 
-            if (_logDirty)
-            {
-                this.ExpireSolution(true);
-                _logDirty = false;
+                //_task = Task.Run(async () => await ConnectToUnreal())
+                // .ContinueWith(task =>
+                //  {
+                //       this.ExpireSolution(true);
+                //   }, TaskScheduler.FromCurrentSynchronizationContext());
+                // }
+                //else
+                // {
+                //      _log.Add("Trying to connect to Unreal");
+                // }
             }
+
             DA.SetDataList("Log", _log);
         }
 
-        protected async Task ConnectToUnreal()
+        private void SendJoints(Program program)
+        {
+            var joints = GetJointsFromProgram(program);
+
+            RobotCell cell = program.RobotSystem as RobotCell;
+            var robot = cell.MechanicalGroups[0].Robot;
+            var bytes = new List<byte>(6 * 4);
+
+            for (int i = 0; i < 6; i++)
+            {
+                var joint = joints[i];
+                var degree = robot.RadianToDegree(joint, i);
+                bytes.AddRange(BitConverter.GetBytes((float)degree));
+            }
+
+            _client.GetStream().Write(bytes.ToArray(), 0, bytes.Count);
+        }
+
+        protected void ConnectToUnreal()
         {
             _log.Add("Waiting for Unreal to connect...");
-            await ConnectAsync(_ip, _port);
+            Connect(_ip, _port);
             if (Connected)
             {
                 _log.Add("Unreal connected.");
@@ -94,79 +133,80 @@ namespace Robots.Grasshopper
 
         }
 
-        protected async Task ConnectAsync(string ip, int port)
+        protected void Connect(string ip, int port)
         {
             try
             {
                 _log.Add("Connecting");
                 IPAddress serverIp = IPAddress.Parse(ip);
+                // Dispose();
                 _server = new TcpListener(serverIp, port);
+                _server.Server.LingerState = new LingerOption(true, 30);
                 _server.Start();
-                _client = await _server.AcceptTcpClientAsync();
 
-                _log.Add($"Connected to - {_client.Client.RemoteEndPoint}");
+                _client = _server.AcceptTcpClient();
+
+                _log.Add($"Connected to - {_server.Server.RemoteEndPoint}");
             }
             catch (SocketException e)
             {
                 _log.Add($"SocketException - {e}");
-            }
 
-            _server.Server.LingerState = new LingerOption(true, 60);
+            }
         }
 
-        public async Task SendJointsAsync(Vector6 joints)
+        Vector6 GetJointsFromProgram(Program program)
         {
-            joints[0] = 30;
-            joints[1] = 50;
-            joints[2] = 90;
-            joints[3] = -20;
-            joints[4] = 120;
-            joints[5] = 50;
-
-            var bytes = new List<byte>(6 * 4);
-
-            for (int i = 0; i < 6; i++)
-            {
-                bytes.AddRange(BitConverter.GetBytes(joints[i]));
-            }
-
-            await SendAsync(bytes.ToArray());
+            var joints = program.CurrentSimulationTarget.Joints;
+            return new Vector6(joints.Select(j => (float)j).ToArray());
         }
 
-        public async Task<int> ReadAsync()
-        {
-            byte[] bytes = new byte[4];
+        //public async Task SendJointsAsync(Vector6 joints)
+        //{
+        //    var bytes = new List<byte>(6 * 4);
 
-            if (!Connected)
-            {
-                _log.Add("Can't receive data, not connected.");
-                return -1;
-            }
+        //    for (int i = 0; i < 6; i++)
+        //    {
+        //        bytes.AddRange(BitConverter.GetBytes(joints[i]));
+        //    }
 
-            var stream = _client.GetStream();
+        //    await SendAsync(bytes.ToArray());
+        //}
 
-            do
-            {
-                await stream.ReadAsync(bytes, 0, bytes.Length);
-            }
-            while (stream.DataAvailable);
+        //public async Task<int> ReadAsync()
+        //{
+        //    byte[] bytes = new byte[4];
 
-            var info = BitConverter.ToInt32(bytes, 0);
-            _log.Add($"Info no. {info}");
-            return info;
-        }
+        //    if (!Connected)
+        //    {
+        //        _log.Add("Can't receive data, not connected.");
+        //        return -1;
+        //    }
 
-        async Task SendAsync(byte[] bytes)
-        {
-            if (!Connected)
-            {
-                _log.Add("Can't send data, not connected.");
-                return;
-            }
+        //    var stream = _client.GetStream();
 
-            var stream = _client.GetStream();
-            await stream.WriteAsync(bytes, 0, bytes.Length);
-        }
+        //    do
+        //    {
+        //        await stream.ReadAsync(bytes, 0, bytes.Length);
+        //    }
+        //    while (stream.DataAvailable);
+
+        //    var info = BitConverter.ToInt32(bytes, 0);
+        //    _log.Add($"Info no. {info}");
+        //    return info;
+        //}
+
+        //async Task SendAsync(byte[] bytes)
+        //{
+        //    if (!Connected)
+        //    {
+        //        _log.Add("Can't send data, not connected.");
+        //        return;
+        //    }
+
+        //   // var stream = _client.GetStream();
+        //    await stream.WriteAsync(bytes, 0, bytes.Length);
+        //}
 
         void Log(string text)
         {
@@ -176,10 +216,13 @@ namespace Robots.Grasshopper
         public void Dispose()
         {
             if (_client == null) return;
+            if (_server == null) return;
 
             _client.Close();
             _client.Dispose();
             _server.Stop();
+            _client = null;
+            _server = null;
             _log.Add("Disconnected.");
         }
 
